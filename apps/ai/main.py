@@ -1,5 +1,3 @@
-from dotenv import load_dotenv
-
 from livekit import agents, rtc
 from livekit.agents import (
     AgentSession,
@@ -13,7 +11,11 @@ from livekit.agents import (
 )
 from livekit.agents.beta.tools import send_dtmf_events
 from livekit.plugins import noise_cancellation, silero
-from livekit.plugins.turn_detector.multilingual import MultilingualModel
+
+# --- LANGFUSE INTEGRATION IMPORTS ---
+from langfuse import Langfuse, observe, get_client
+# ------------------------------------
+
 from handlers.call_metadata_collector import CallMetadataCollector, build_metadata_collection_instructions
 from handlers.calllog_handler import flush_call_log_queue
 from handlers.config_handler import get_config
@@ -39,6 +41,7 @@ from handlers.voice_catalog import load_voice_catalog
 from handlers.voice_config_resolution import resolve_voice_config
 from handlers.voice_provider_adapters import ProviderAdapterError, build_voice_provider_adapters
 from handlers.voice_worker_metadata import is_voice_session_metadata, parse_voice_session_metadata
+from utils.env_loader import load_app_env
 from utils.logger import logger
 from utils.logger import redact_sensitive
 import asyncio
@@ -52,7 +55,12 @@ import sys
 import time
 
 APP_DIR = Path(__file__).resolve().parent
-load_dotenv(APP_DIR / ".env")
+load_app_env(APP_DIR)
+
+# --- INITIALIZE LANGFUSE ---
+# Reads LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST from .env
+langfuse_client = Langfuse()
+# ---------------------------
 
 API_PORT = int(os.getenv("AI_API_PORT", "5555"))
 DEFAULT_SYSTEM_PROMPT = (
@@ -117,7 +125,6 @@ def build_agent_instructions(config: dict) -> str:
     instructions += build_http_tool_instructions(config.get("tools") or [])
     instructions += build_mcp_tool_instructions(config.get("mcp_connections") or [])
     return instructions
-
 
 
 def build_room_options() -> room_io.RoomOptions:
@@ -287,7 +294,27 @@ class Assistant(Agent):
             or ""
         )
 
+    # --- TRACED TURN HANDLER ---
+    @observe(name="user_turn_completed")
     async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+        query = new_message.text_content if hasattr(new_message, "text_content") else ""
+        if callable(query):
+            query = query()
+        query_str = str(query or "").strip()
+
+        # Update trace metadata dynamically inside the decorated function
+        active_client = get_client()
+        update_fn = getattr(active_client, "update_current_span", getattr(active_client, "update_current_trace", None))
+        if update_fn:
+            update_fn(
+                name="voice_conversation_turn",
+                input=query_str,
+                metadata={
+                    "agent_id": self._agent_id(),
+                    "rag_enabled": self._rag_enabled()
+                }
+            )
+
         if not self._rag_enabled():
             return
 
@@ -296,15 +323,11 @@ class Assistant(Agent):
             logger.warning("[rag] skipped retrieval because agent_id is missing")
             return
 
-        query = new_message.text_content if hasattr(new_message, "text_content") else ""
-        if callable(query):
-            query = query()
-        query = str(query or "").strip()
-        if not query:
+        if not query_str:
             return
 
         try:
-            context = await get_rag_context(agent_id=agent_id, query=query)
+            context = await get_rag_context(agent_id=agent_id, query=query_str)
         except RagRetrievalError:
             turn_ctx.add_message(
                 role="system",
@@ -348,36 +371,18 @@ class Assistant(Agent):
             )
 
     @function_tool
+    @observe(name="record_call_extracted_data")
     async def record_call_extracted_data(self, field: str, value: str) -> str:
-        """
-        Record a configured data field collected from the caller during this call.
-
-        Args:
-            field: The configured data field id or name.
-            value: The value the caller provided for that field.
-        """
         return self._metadata_collector.record_extracted_data(field, value)
 
     @function_tool
+    @observe(name="record_call_evaluation")
     async def record_call_evaluation(self, identifier: str, value: str) -> str:
-        """
-        Record a configured call evaluation result when the conversation provides enough evidence.
-
-        Args:
-            identifier: The configured evaluation id or name.
-            value: The evaluation result, such as true, false, yes, no, or a short label.
-        """
         return self._metadata_collector.record_evaluation(identifier, value)
 
     @function_tool
+    @observe(name="search_knowledge_base")
     async def search_knowledge_base(self, query: str, top_k: int = 5) -> str:
-        """
-        Search the configured agent knowledge base for relevant context.
-
-        Args:
-            query: The user question or the topic to search for.
-            top_k: Maximum number of matching chunks to retrieve.
-        """
         if not self._rag_enabled():
             return "Knowledge base search is disabled for this agent."
 
@@ -396,14 +401,8 @@ class Assistant(Agent):
         return context or "No matching knowledge base context found."
 
     @function_tool
+    @observe(name="call_http_tool")
     async def call_http_tool(self, tool_name: str, arguments_json: str = "{}") -> str:
-        """
-        Call an attached HTTP tool configured for this agent.
-
-        Args:
-            tool_name: The exact HTTP tool name from the attached HTTP tools list.
-            arguments_json: A JSON object string containing the tool arguments.
-        """
         arguments = parse_http_tool_arguments(arguments_json)
         result = await call_http_tool(
             tool_name=tool_name,
@@ -414,15 +413,8 @@ class Assistant(Agent):
         return json.dumps(result.get("data", result), ensure_ascii=False)
 
     @function_tool
+    @observe(name="call_mcp_tool")
     async def call_mcp_tool(self, connection_id: str, tool_name: str, arguments_json: str = "{}") -> str:
-        """
-        Call an attached MCP tool using a connected MCP connection.
-
-        Args:
-            connection_id: The MCP connection ID from the connected tools list.
-            tool_name: The exact MCP tool name to execute.
-            arguments_json: A JSON object string containing the tool arguments.
-        """
         arguments = parse_arguments_json(arguments_json)
         result = await call_mcp_tool(
             connection_id=connection_id,
@@ -434,6 +426,8 @@ class Assistant(Agent):
         return json.dumps(result.get("data", result), ensure_ascii=False)
 
 
+# --- TRACED ENTRYPOINT ---
+@observe(name="voice_session_entrypoint")
 async def entrypoint(ctx: JobContext):
     logger.info("Entrypoint called with room: {}", redact_sensitive(ctx.room.name))
 
@@ -497,20 +491,10 @@ async def entrypoint(ctx: JobContext):
         return
 
     config["ivr_navigation_enabled"] = ivr_navigation_enabled(config, call_context)
-    logger.info(
-        "[IVR] navigation state: {}",
-        redact_sensitive(
-            {
-                "enabled": config["ivr_navigation_enabled"],
-                "direction": call_context.get("direction"),
-                "agent_id": call_context.get("agent_id") or config.get("agent_id"),
-            }
-        ),
-    )
     session = AgentSession(
         **provider_kwargs,
         vad=silero.VAD.load(),
-        turn_handling=TurnHandlingOptions(turn_detection=MultilingualModel()),
+        turn_handling=TurnHandlingOptions(turn_detection=inference.TurnDetector()),
         ivr_detection=config["ivr_navigation_enabled"],
         preemptive_generation=config.get("preemptive_generation", True),
     )
@@ -587,7 +571,6 @@ async def entrypoint(ctx: JobContext):
     else:
         logger.info("[RECORDING] skipped by agent privacy controls")
     recording_path = build_recording_path(recording_id) if recording_id else None
-    shutdown_started = False
 
     call_finalizer = CallFinalizer(
         config=config,
@@ -599,6 +582,8 @@ async def entrypoint(ctx: JobContext):
     shutdown_reason = "session_shutdown"
 
     async def unified_shutdown_hook():
+        # Flush pending Langfuse traces on shutdown
+        langfuse_client.flush()
         try:
             await live_transcript_publisher.close(reason=shutdown_reason)
         except Exception as error:
@@ -618,11 +603,8 @@ async def entrypoint(ctx: JobContext):
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
-        nonlocal shutdown_started, shutdown_reason
+        nonlocal shutdown_reason
         logger.info("[HANGUP] Participant disconnected: {}", redact_sensitive(getattr(participant, "identity", "")))
-        if shutdown_started:
-            return
-        shutdown_started = True
         shutdown_reason = "participant_disconnected"
         asyncio.create_task(unified_shutdown_hook())
 

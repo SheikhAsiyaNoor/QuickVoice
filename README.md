@@ -119,6 +119,23 @@ Voice agents are becoming core business infrastructure. Hosted APIs are useful w
 - **Live knowledge and tools:** agents can retrieve Pinecone-backed knowledge context during user turns and call allowlisted MCP tools through the server bridge. Side-effect tools are hidden from live-call instructions unless explicitly safe.
 - **Inspectable privacy boundaries:** call-log PII redaction is enabled by default, zero-PII retention can suppress transcripts and recordings, secrets are encrypted or referenced, remote URLs are screened for private-network targets, and retention jobs clean up old transcripts, recordings, failed KB rows, and MCP logs.
 - **Direct telephony ownership:** Twilio and Telnyx number purchase flows, provider binding, LiveKit trunk binding, rollback behavior, inbound routing, outbound quick calls, and batch campaigns are implemented in the repo.
+- **Langfuse Observability & Evaluation:** Real-time distributed tracing of voice session entrypoints, conversation turns, RAG knowledge retrieval, LLM-based call criteria evaluations, and tool calls powered by Langfuse.
+
+## Langfuse Observability & Evaluation
+
+QuickVoice features built-in integration with [Langfuse](https://github.com/langfuse/langfuse) for enterprise-grade LLM observability, session tracing, and evaluation.
+
+- **Voice Session Tracing:** Real-time turn tracking and session lifecycle tracing via `@observe` decorators.
+- **Evaluation & Metadata Extraction:** Automatic score logging for LLM call criteria evaluations (`record_call_evaluation`) and structured data extraction (`record_call_extracted_data`).
+- **RAG & Tool Monitoring:** Full observation spans for Pinecone RAG retrievals, custom HTTP tools, and Model Context Protocol (MCP) executions.
+- **Graceful Telemetry Flushing:** Ensures call session spans and evaluation metrics are reliably flushed to Langfuse on call termination.
+
+Configure Langfuse keys in `apps/ai/.env`:
+```env
+LANGFUSE_PUBLIC_KEY="pk-lf-..."
+LANGFUSE_SECRET_KEY="sk-lf-..."
+LANGFUSE_BASE_URL="https://cloud.langfuse.com"
+```
 
 ## What QuickVoice Is Not
 
@@ -196,6 +213,7 @@ cd apps/ai
 - Telephony: Twilio and Telnyx
 - AI providers: configurable commercial STT, LLM, and TTS model IDs through LiveKit inference; the default path is not local LLM deployment
 - Knowledge and tools: Pinecone, Google embeddings, MCP/Smithery connections, custom HTTP tools
+- Observability & Evaluation: Langfuse (session tracing, turn-by-turn telemetry, RAG monitoring, and evaluation scorecards)
 - Data: Postgres, Prisma, Redis/BullMQ, S3-compatible object storage
 - Billing: Stripe
 - Monorepo: pnpm and Turborepo
